@@ -27,6 +27,57 @@ class FinalizedItem(BaseModel):
     text: Optional[str] = Field(None, description="字幕文本（仅字幕条目存在）")
     start_seq: Optional[int] = Field(None, description="缺口区间起点（仅缺口条目存在）")
     end_seq: Optional[int] = Field(None, description="缺口区间终点（仅缺口条目存在）")
+    correction_version: Optional[int] = Field(
+        None,
+        description="最新更正版本（仅 view=effective 的字幕条目返回，无更正为 0；其余情况为 null）",
+    )
+
+
+class CorrectionIn(BaseModel):
+    seq: int = Field(..., ge=1, description="要更正的定稿序号")
+    expected_version: int = Field(
+        ..., ge=0, description="期望的当前更正版本（该序号尚无更正时为 0）"
+    )
+    text: str = Field(..., description="更正后的字幕文本")
+    reason: str = Field(..., min_length=1, description="更正原因（审计用途，必填且非空）")
+
+
+class CorrectionResponse(BaseModel):
+    channel: str
+    seq: int
+    applied: bool = Field(..., description="更正是否追加成功；false 时不产生任何写入")
+    reason: Optional[str] = Field(
+        None,
+        description=(
+            "未生效原因：not_finalized=序号尚未定稿；gap_seq=序号已裁决为永久缺口；"
+            "version_conflict=expected_version 与当前更正版本不一致"
+        ),
+    )
+    correction_version: Optional[int] = Field(
+        None, description="本次追加的更正版本号（仅成功时存在）"
+    )
+    current_version: int = Field(
+        ..., description="该序号当前最新更正版本（无更正为 0）；版本冲突时供客户端据此重试"
+    )
+
+
+class CorrectionEntry(BaseModel):
+    version: int
+    text: str
+    reason: str
+    created_at: str
+
+
+class CorrectionHistoryResponse(BaseModel):
+    channel: str
+    seq: int
+    finalized: bool = Field(
+        ..., description="该序号是否已定稿（缺口或未定稿时 corrections 恒为空）"
+    )
+    correction_version: int = Field(..., description="当前最新更正版本，无更正为 0")
+    corrections: List[CorrectionEntry] = Field(
+        default_factory=list, description="按版本升序的更正审计记录"
+    )
 
 
 class SubmitResponse(BaseModel):

@@ -60,6 +60,20 @@ CREATE TABLE IF NOT EXISTS gaps (
     PRIMARY KEY (channel, seq),
     FOREIGN KEY (channel, start_seq, end_seq) REFERENCES gap_decisions
 );
+
+-- 定稿更正：只追加、不可修改/删除，原定稿记录永不改写。
+-- version 对每个 (channel, seq) 从 1 起连续递增，
+-- 主键 (channel, seq, version) 防止并发下重复追加同一版本
+CREATE TABLE IF NOT EXISTS corrections (
+    channel    TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    version    INTEGER NOT NULL,
+    text       TEXT NOT NULL,
+    reason     TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (channel, seq, version),
+    FOREIGN KEY (channel, seq) REFERENCES finalized (channel, seq)
+);
 """
 
 _lock = threading.RLock()

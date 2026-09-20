@@ -356,3 +356,221 @@ def test_gap_on_unknown_channel_starts_at_one(client):
     body = decide_gap(client, "fresh", 5, 6)
     assert body["applied"] is False
     assert body["reason"] == "start_not_at_watermark"
+
+
+# ---------- 定稿更正（不可变追加层） ----------
+
+
+def correct(client, channel, seq, expected_version, text="fixed", reason="错别字"):
+    resp = client.post(
+        f"/channels/{channel}/corrections",
+        json={
+            "seq": seq,
+            "expected_version": expected_version,
+            "text": text,
+            "reason": reason,
+        },
+    )
+    assert resp.status_code == 200
+    return resp.json()
+
+
+def test_correction_appends_consecutive_versions(client):
+    submit(client, "c1", 1, 1, "orig")
+
+    body = correct(client, "c1", 1, 0, "fix-1", "第一次更正")
+    assert body["applied"] is True
+    assert body["reason"] is None
+    assert body["correction_version"] == 1
+    assert body["current_version"] == 1
+
+    body = correct(client, "c1", 1, 1, "fix-2", "第二次更正")
+    assert body["applied"] is True
+    assert body["correction_version"] == 2
+    assert body["current_version"] == 2
+
+    # 审计链按版本升序，文本与原因完整保留
+    audit = client.get("/channels/c1/corrections/1").json()
+    assert audit["finalized"] is True
+    assert audit["correction_version"] == 2
+    assert [c["version"] for c in audit["corrections"]] == [1, 2]
+    assert [c["text"] for c in audit["corrections"]] == ["fix-1", "fix-2"]
+    assert [c["reason"] for c in audit["corrections"]] == ["第一次更正", "第二次更正"]
+    assert all(c["created_at"] for c in audit["corrections"])
+
+
+def test_correction_rejected_for_unfinalized_seq(client, conn):
+    submit(client, "c1", 2, 1, "buffered")  # 已缓冲但未定稿（缺口 1 未补齐）
+
+    for seq in (1, 2, 99):  # 未到达 / 仍在缓冲 / 远超水位线
+        body = correct(client, "c1", seq, 0, "nope")
+        assert body["applied"] is False
+        assert body["reason"] == "not_finalized"
+        assert body["correction_version"] is None
+        assert body["current_version"] == 0
+
+    body = correct(client, "unknown", 1, 0, "nope")  # 频道不存在
+    assert body["applied"] is False
+    assert body["reason"] == "not_finalized"
+
+    # 拒绝不得产生任何写入
+    assert conn.execute("SELECT COUNT(*) AS c FROM corrections").fetchone()["c"] == 0
+
+
+def test_correction_rejected_for_gap_seq(client, conn):
+    submit(client, "c1", 1, 1, "one")
+    decide_gap(client, "c1", 2, 3)
+
+    body = correct(client, "c1", 2, 0, "nope")
+    assert body["applied"] is False
+    assert body["reason"] == "gap_seq"
+    assert body["current_version"] == 0
+    assert conn.execute("SELECT COUNT(*) AS c FROM corrections").fetchone()["c"] == 0
+
+    # 缺口前后的定稿字幕不受影响，仍可正常更正
+    assert correct(client, "c1", 1, 0, "fixed")["applied"] is True
+
+
+def test_correction_version_conflict_returns_current_version(client, conn):
+    submit(client, "c1", 1, 1, "orig")
+
+    # 当前版本为 0，期望 1 直接冲突
+    body = correct(client, "c1", 1, 1, "skip")
+    assert body["applied"] is False
+    assert body["reason"] == "version_conflict"
+    assert body["correction_version"] is None
+    assert body["current_version"] == 0
+
+    assert correct(client, "c1", 1, 0, "fix-1")["applied"] is True
+
+    # 当前版本已为 1，再用 0 或 2 提交均冲突，并返回当前版本供重试
+    for expected in (0, 2, 99):
+        body = correct(client, "c1", 1, expected, "stale")
+        assert body["applied"] is False
+        assert body["reason"] == "version_conflict"
+        assert body["current_version"] == 1
+
+    # 冲突不产生写入：审计链仍只有一条
+    audit = client.get("/channels/c1/corrections/1").json()
+    assert [c["version"] for c in audit["corrections"]] == [1]
+    assert conn.execute(
+        "SELECT COUNT(*) AS c FROM corrections WHERE channel = 'c1'"
+    ).fetchone()["c"] == 1
+
+
+def test_correction_never_rewrites_original(client, conn):
+    submit(client, "c1", 1, 1, "原始文本")
+    correct(client, "c1", 1, 0, "更正一")
+    correct(client, "c1", 1, 1, "更正二")
+
+    # 数据库中的定稿原文不变
+    row = conn.execute(
+        "SELECT revision, text FROM finalized WHERE channel = 'c1' AND seq = 1"
+    ).fetchone()
+    assert (row["revision"], row["text"]) == (1, "原始文本")
+
+    # 默认视图（original）保持兼容，仍返回原文且不暴露更正版本
+    resp = client.get("/channels/c1/finalized").json()
+    item = resp["items"][0]
+    assert item["text"] == "原始文本"
+    assert item["correction_version"] is None
+
+    resp = client.get("/channels/c1/finalized", params={"view": "original"}).json()
+    assert resp["items"][0]["text"] == "原始文本"
+
+
+def test_effective_view_merges_latest_correction(client):
+    submit(client, "c1", 1, 1, "one")
+    submit(client, "c1", 2, 1, "two")
+    submit(client, "c1", 5, 1, "five")
+    decide_gap(client, "c1", 3, 4)
+    correct(client, "c1", 1, 0, "one-v2", "错字")
+    correct(client, "c1", 1, 1, "one-v3", "再改")
+    correct(client, "c1", 5, 0, "five-v2", "漏字")
+
+    resp = client.get("/channels/c1/finalized", params={"view": "effective"}).json()
+    assert resp["watermark"] == 5
+    items = {i["seq"]: i for i in resp["items"]}
+    # 合并最新更正文本与版本号
+    assert items[1]["text"] == "one-v3"
+    assert items[1]["correction_version"] == 2
+    # 未更正的字幕保持原文，版本为 0
+    assert items[2]["text"] == "two"
+    assert items[2]["correction_version"] == 0
+    # 缺口标记不受更正影响
+    assert items[3]["kind"] == "gap"
+    assert items[3]["correction_version"] is None
+    assert items[5]["text"] == "five-v2"
+    assert items[5]["correction_version"] == 1
+
+    # effective 视图同样支持 after/limit 增量拉取
+    resp = client.get(
+        "/channels/c1/finalized", params={"view": "effective", "after": 1, "limit": 2}
+    ).json()
+    assert [i["seq"] for i in resp["items"]] == [2, 3]
+
+    # 非法视图返回 422
+    assert client.get("/channels/c1/finalized", params={"view": "bogus"}).status_code == 422
+
+
+def test_correction_audit_for_seq_without_corrections(client):
+    submit(client, "c1", 1, 1, "orig")
+
+    audit = client.get("/channels/c1/corrections/1").json()
+    assert audit["finalized"] is True
+    assert audit["correction_version"] == 0
+    assert audit["corrections"] == []
+
+    # 未定稿序号：空链且 finalized=false
+    audit = client.get("/channels/c1/corrections/7").json()
+    assert audit["finalized"] is False
+    assert audit["correction_version"] == 0
+    assert audit["corrections"] == []
+
+
+def test_correction_validation_rejects_bad_input(client):
+    submit(client, "c1", 1, 1, "orig")
+    base = "/channels/c1/corrections"
+    resp = client.post(base, json={"seq": 0, "expected_version": 0, "text": "x", "reason": "r"})
+    assert resp.status_code == 422
+    resp = client.post(base, json={"seq": 1, "expected_version": -1, "text": "x", "reason": "r"})
+    assert resp.status_code == 422
+    resp = client.post(base, json={"seq": 1, "expected_version": 0, "text": "x", "reason": ""})
+    assert resp.status_code == 422
+    resp = client.post(base, json={"seq": 1, "expected_version": 0, "text": "x"})
+    assert resp.status_code == 422
+
+
+def test_concurrent_corrections_single_winner_per_version(client, conn):
+    """多线程以相同 expected_version 竞争：每个版本只有一个追加成功。"""
+    submit(client, "race", 1, 1, "orig")
+
+    def race(expected):
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            return list(
+                pool.map(
+                    lambda i: service.submit_correction(
+                        "race", 1, expected, f"fix-{expected}-{i}", "并发更正"
+                    ),
+                    range(16),
+                )
+            )
+
+    for version in (1, 2, 3):
+        results = race(version - 1)
+        winners = [r for r in results if r["applied"]]
+        losers = [r for r in results if not r["applied"]]
+        assert len(winners) == 1
+        assert winners[0]["correction_version"] == version
+        assert len(losers) == 15
+        assert all(r["reason"] == "version_conflict" for r in losers)
+        assert all(r["current_version"] == version for r in losers)
+
+    rows = conn.execute(
+        "SELECT version FROM corrections WHERE channel = 'race' AND seq = 1 ORDER BY version"
+    ).fetchall()
+    assert [r["version"] for r in rows] == [1, 2, 3]  # 链连续无重复
+    # 并发更正全程不改写原定稿
+    assert conn.execute(
+        "SELECT text FROM finalized WHERE channel = 'race' AND seq = 1"
+    ).fetchone()["text"] == "orig"

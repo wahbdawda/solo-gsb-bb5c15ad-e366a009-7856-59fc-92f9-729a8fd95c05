@@ -60,6 +60,34 @@ CREATE TABLE IF NOT EXISTS gaps (
     PRIMARY KEY (channel, seq),
     FOREIGN KEY (channel, start_seq, end_seq) REFERENCES gap_decisions
 );
+
+-- 追加式更正层：只允许 INSERT，永不 UPDATE/DELETE。
+-- (channel, seq) 外键引用 finalized：只有已定稿字幕可被更正，
+-- 缺口序号（只存在于 gaps）或未定稿序号在存储层即无法插入；
+-- version 在每个 (channel, seq) 内从 1 起单调递增，0 表示“无更正”。
+CREATE TABLE IF NOT EXISTS corrections (
+    channel    TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    version    INTEGER NOT NULL,
+    text       TEXT NOT NULL,
+    reason     TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (channel, seq, version),
+    FOREIGN KEY (channel, seq) REFERENCES finalized (channel, seq)
+);
+
+-- 不可变保证：应用层只做追加，触发器在存储层拒绝任何改写与删除
+CREATE TRIGGER IF NOT EXISTS corrections_no_update
+BEFORE UPDATE ON corrections
+BEGIN
+    SELECT RAISE(ABORT, 'corrections is append-only: UPDATE is forbidden');
+END;
+
+CREATE TRIGGER IF NOT EXISTS corrections_no_delete
+BEFORE DELETE ON corrections
+BEGIN
+    SELECT RAISE(ABORT, 'corrections is append-only: DELETE is forbidden');
+END;
 """
 
 _lock = threading.RLock()

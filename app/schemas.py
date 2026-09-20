@@ -1,6 +1,6 @@
-from typing import List, Optional
+from typing import List, Literal, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class FragmentIn(BaseModel):
@@ -27,6 +27,22 @@ class FinalizedItem(BaseModel):
     text: Optional[str] = Field(None, description="字幕文本（仅字幕条目存在）")
     start_seq: Optional[int] = Field(None, description="缺口区间起点（仅缺口条目存在）")
     end_seq: Optional[int] = Field(None, description="缺口区间终点（仅缺口条目存在）")
+
+
+class FinalizedEffectiveItem(BaseModel):
+    kind: str = Field("subtitle", description="条目类型：subtitle=字幕（已合并最新更正）；gap=永久缺口标记")
+    seq: int
+    revision: Optional[int] = Field(None, description="原始定稿修订号（仅字幕条目存在）")
+    text: Optional[str] = Field(None, description="生效文本：original 视图为定稿原文，effective 视图为最新更正文本")
+    start_seq: Optional[int] = Field(None, description="缺口区间起点（仅缺口条目存在）")
+    end_seq: Optional[int] = Field(None, description="缺口区间终点（仅缺口条目存在）")
+    correction_version: Optional[int] = Field(
+        None,
+        description=(
+            "该序号的当前更正版本：字幕条目恒返回，0=未更正、>0=已合并的更正版本；"
+            "缺口条目为 null。仅 effective 视图返回该字段"
+        ),
+    )
 
 
 class SubmitResponse(BaseModel):
@@ -73,3 +89,68 @@ class FinalizedResponse(BaseModel):
     items: List[FinalizedItem] = Field(
         ..., description="按序号升序混合返回字幕（kind=subtitle）与缺口标记（kind=gap）"
     )
+
+
+class FinalizedEffectiveResponse(BaseModel):
+    channel: str
+    watermark: int
+    view: Literal["effective"] = Field("effective", description="视图：effective=合并最新更正文本")
+    correction_version: int = Field(
+        ..., description="本页范围内出现过的最大更正版本（0 表示本页均无更正）"
+    )
+    items: List[FinalizedEffectiveItem] = Field(
+        ..., description="按序号升序混合返回生效字幕（已合并最新更正）与缺口标记"
+    )
+
+
+# ---------- 追加式更正层 ----------
+
+
+class CorrectionIn(BaseModel):
+    expected_version: int = Field(
+        ...,
+        ge=0,
+        description="客户端认为的当前更正版本：无更正时必须为 0，之后必须等于该序号最新更正版本",
+    )
+    text: str = Field(..., min_length=1, description="更正后的字幕文本")
+    reason: str = Field(..., min_length=1, description="更正原因（随审计记录永久保留）")
+
+    @field_validator("text", "reason")
+    @classmethod
+    def _strip_and_require_nonblank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("不得为空白字符串")
+        return v
+
+
+class CorrectionResponse(BaseModel):
+    channel: str
+    seq: int = Field(..., description="被更正的定稿序号")
+    correction_version: int = Field(..., description="本次追加后该序号的更正版本（首个更正为 1）")
+    text: str = Field(..., description="本次更正文本（原始定稿不受影响，仍可经 view=original 查询）")
+    reason: str
+    created_at: str = Field(..., description="更正落库时间（UTC ISO8601）")
+
+
+class CorrectionAuditItem(BaseModel):
+    channel: str
+    seq: int
+    version: int = Field(..., description="更正版本，从 1 起递增")
+    text: str = Field(..., description="该版本的更正文本")
+    reason: str
+    created_at: str
+
+
+class CorrectionAuditResponse(BaseModel):
+    channel: str
+    seq: int
+    current_version: int = Field(..., description="该序号当前更正版本（0 表示尚无更正）")
+    items: List[CorrectionAuditItem] = Field(
+        ..., description="该序号的全部更正记录，按 version 升序"
+    )
+
+
+class ErrorResponse(BaseModel):
+    error: str = Field(..., description="错误码")
+    message: str
